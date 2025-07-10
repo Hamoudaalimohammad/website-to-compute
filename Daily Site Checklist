@@ -1,0 +1,402 @@
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:image_picker/image_picker.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Daily Site Checklist',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      darkTheme: ThemeData(
+        primarySwatch: Colors.blue,
+        brightness: Brightness.dark,
+      ),
+      themeMode: ThemeMode.system,
+      initialRoute: '/',
+      routes: {
+        '/': (context) => HomeScreen(),
+        '/login': (context) => LoginScreen(),
+        '/reports': (context) => ReportsScreen(),
+        '/settings': (context) => SettingsScreen(),
+      },
+    );
+  }
+}
+
+// Models
+class Checklist {
+  final int id;
+  final String? userId;
+  final DateTime date;
+  String? signaturePath;
+
+  Checklist({
+    required this.id,
+    this.userId,
+    required this.date,
+    this.signaturePath,
+  });
+}
+
+class Task {
+  final int id;
+  final int checklistId;
+  final String description;
+  bool isCompleted;
+  String? note;
+
+  Task({
+    required this.id,
+    required this.checklistId,
+    required this.description,
+    this.isCompleted = false,
+    this.note,
+  });
+}
+
+class TaskImage {
+  final int id;
+  final int taskId;
+  final String imagePath;
+
+  TaskImage({
+    required this.id,
+    required this.taskId,
+    required this.imagePath,
+  });
+}
+
+// Database Helper
+class DatabaseHelper {
+  static Database? _database;
+  static DatabaseHelper? _instance;
+
+  factory DatabaseHelper() => _instance ??= DatabaseHelper._();
+
+  DatabaseHelper._();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDB();
+    return _database!;
+  }
+
+  Future<Database> _initDB() async {
+    Directory dir = await getApplicationDocumentsDirectory();
+    String path = join(dir.path, 'checklist.db');
+    return await openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE checklists (
+            id INTEGER PRIMARY KEY,
+            userId TEXT,
+            date TEXT,
+            signaturePath TEXT
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY,
+            checklistId INTEGER,
+            description TEXT,
+            isCompleted INTEGER,
+            note TEXT,
+            FOREIGN KEY (checklistId) REFERENCES checklists (id)
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE task_images (
+            id INTEGER PRIMARY KEY,
+            taskId INTEGER,
+            imagePath TEXT,
+            FOREIGN KEY (taskId) REFERENCES tasks (id)
+          )
+        ''');
+      },
+    );
+  }
+
+  Future<int> insertChecklist(Checklist checklist) async {
+    final db = await database;
+    return await db.insert('checklists', {
+      'userId': checklist.userId,
+      'date': checklist.date.toIso8601String().split('T')[0],
+      'signaturePath': checklist.signaturePath,
+    });
+  }
+
+  Future<List<Checklist>> getChecklists() async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query('checklists');
+    return List.generate(maps.length, (i) {
+      return Checklist(
+        id: maps[i]['id'],
+        userId: maps[i]['userId'],
+        date: DateTime.parse(maps[i]['date']),
+        signaturePath: maps[i]['signaturePath'],
+      );
+    });
+  }
+
+  Future<int> insertTask(Task task) async {
+    final db = await database;
+    return await db.insert('tasks', {
+      'checklistId': task.checklistId,
+      'description': task.description,
+      'isCompleted': task.isCompleted ? 1 : 0,
+      'note': task.note,
+    });
+  }
+
+  Future<List<Task>> getTasksForChecklist(int checklistId) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'tasks',
+      where: 'checklistId = ?',
+      whereArgs: [checklistId],
+    );
+    return List.generate(maps.length, (i) {
+      return Task(
+        id: maps[i]['id'],
+        checklistId: maps[i]['checklistId'],
+        description: maps[i]['description'],
+        isCompleted: maps[i]['isCompleted'] == 1,
+        note: maps[i]['note'],
+      );
+    });
+  }
+
+  // Additional methods for update, delete, etc.
+}
+
+// Auth Service
+class AuthService {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+
+  Future<User?> signIn(String email, String password) async {
+    try {
+      UserCredential result = await _auth.signInWithEmailAndPassword(email: email, password: password);
+      return result.user;
+    } catch (e) {
+      print(e);
+      return null;
+    }
+  }
+
+  Future<User?> signUp(String email, String password) async {
+    try {
+      UserCredential result = await _auth.createUserWithEmailAndPassword(email: email, password: password);
+      return result.user;
+    } catch (e) {
+      print(e);
+      return null;
+    }
+  }
+
+  Future<void> signOut() async {
+    await _auth.signOut();
+  }
+}
+
+// Notification Service
+class NotificationService {
+  final FlutterLocalNotificationsPlugin notifications = FlutterLocalNotificationsPlugin();
+
+  Future<void> initialize() async {
+    const AndroidInitializationSettings initializationSettingsAndroid =
+        AndroidInitializationSettings('app_icon');
+    final InitializationSettings initializationSettings = InitializationSettings(
+      android: initializationSettingsAndroid,
+    );
+    await notifications.initialize(initializationSettings);
+  }
+
+  Future<void> scheduleDailyNotification() async {
+    const AndroidNotificationDetails androidPlatformChannelSpecifics =
+        AndroidNotificationDetails('checklist_channel', 'Daily Checklist Reminder',
+            importance: Importance.max,
+            priority: Priority.high,
+            showWhen: false);
+    const NotificationDetails platformChannelSpecifics =
+        NotificationDetails(android: androidPlatformChannelSpecifics);
+    await notifications.periodic(
+      const Duration(days: 1),
+      0,
+      const Notification(
+        title: 'Daily Checklist Reminder',
+        body: 'Please complete your daily site checklist.',
+      ),
+      platformChannelSpecifics,
+      payload: 'checklist_reminder',
+    );
+  }
+}
+
+// Home Screen
+class HomeScreen extends StatefulWidget {
+  @override
+  _HomeScreenState createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+  final AuthService _authService = AuthService();
+  List<Task> _tasks = [];
+  Checklist? _currentChecklist;
+  bool _isLoggedIn = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkCurrentUser();
+    _loadChecklist();
+  }
+
+  Future<void> _checkCurrentUser() async {
+    User? user = FirebaseAuth.instance.currentUser;
+    setState(() {
+      _isLoggedIn = user != null;
+    });
+  }
+
+  Future<void> _loadChecklist() async {
+    DateTime today = DateTime.now();
+    String todayStr = today.toIso8601String().split('T')[0];
+    // Check if a checklist exists for today
+    // For simplicity, assume we fetch the checklist for today
+    // In real app, query by date
+    // This is a placeholder; actual implementation would query SQLite
+    // For example:
+    // List<Checklist> checklists = await _dbHelper.getChecklistsByDate(todayStr);
+    // if (checklists.isEmpty) {
+    //   create new checklist
+    // } else {
+    //   _currentChecklist = checklists.first;
+    //   _tasks = await _dbHelper.getTasksForChecklist(checklists.first.id);
+    // }
+    // For demo, create a sample checklist
+    _currentChecklist = Checklist(
+      id: 1,
+      date: today,
+    );
+    _tasks = [
+      Task(id: 1, checklistId: 1, description: 'Check site safety'),
+      Task(id: 2, checklistId: 1, description: 'Inspect equipment'),
+    ];
+    setState(() {});
+  }
+
+  void _addTask(String description) {
+    // Add task to database
+    Task newTask = Task(
+      id: _tasks.length + 1,
+      checklistId: _currentChecklist!.id,
+      description: description,
+    );
+    setState(() {
+      _tasks.add(newTask);
+    });
+  }
+
+  void _toggleTask(int taskId) {
+    setState(() {
+      _tasks = _tasks.map((task) {
+        if (task.id == taskId) {
+          task.isCompleted = !task.isCompleted;
+        }
+        return task;
+      }).toList();
+    });
+  }
+
+  void _generatePDF() async {
+    // Generate PDF logic
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Today\'s Checklist'),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.logout),
+            onPressed: () async {
+              await _authService.signOut();
+              Navigator.pushReplacementNamed(context, '/login');
+            },
+          ),
+        ],
+      ),
+      body: ListView.builder(
+        itemCount: _tasks.length + 1, // +1 for add task button
+        itemBuilder: (context, index) {
+          if (index == _tasks.length) {
+            return ListTile(
+              leading: Icon(Icons.add),
+              title: Text('Add New Task'),
+              onTap: () {
+                // Show dialog to add task
+              },
+            );
+          }
+          Task task = _tasks[index];
+          return CheckboxListTile(
+            title: Text(task.description),
+            value: task.isCompleted,
+            onChanged: (value) => _toggleTask(task.id),
+            secondary: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: Icon(Icons.camera_alt),
+                  onPressed: () {
+                    // Attach photo
+                  },
+                ),
+                IconButton(
+                  icon: Icon(Icons.notes),
+                  onPressed: () {
+                    // Add note
+                  },
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _generatePDF,
+        child: Icon(Icons.picture_as_pdf),
+        tooltip: 'Generate PDF',
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: 0,
+        onTap: (index) {
+          if (index == 1) {
+            Navigator.pushNamed(context, '/reports');
+          } else if (index == 2) {
+            Navigator.pushNamed(context, '/settings');
+          }
+        },
+        items: [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label
